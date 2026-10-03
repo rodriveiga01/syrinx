@@ -50,9 +50,9 @@ Click any text field, **hold Right Option, speak, release**. That's it.
 - The Accessibility grant is tied to the Homebrew Python build — after `brew upgrade` replaces Python, re-grant it once.
 - Clipboard is briefly borrowed for pasting (restored right after, unless you copy something new mid-paste).
 
-## Credits
+## Credits & licenses
 
-Speech model and engine: [Cactus Whistle / Needle](https://cactuscompute.com/blog/whistle) (`cactus-needle`,7 languages, 16.9 MB). UI inspiration: Wispr Flow's floating bar.
+Speech model ([Whistle](https://huggingface.co/Cactus-Compute/whistle)) and engine (`cactus-needle`) are by [Cactus Compute](https://cactuscompute.com/blog/whistle) under **Apache-2.0**. Syrinx ships no Cactus code or weights — the installer downloads them from upstream. UI inspiration: Wispr Flow's floating bar. Syrinx itself is MIT.
 
 ## License
 

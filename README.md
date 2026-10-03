@@ -4,7 +4,9 @@
 
 Hold-to-talk dictation for macOS. Hold Right Option, speak, release — your words land wherever the cursor is. Fully on-device, no account, no cloud.
 
-![Syrinx listening pill](assets/pill.png)
+![Syrinx — hold to talk, release to type](assets/hero.png)
+
+<img src="assets/pill.png" width="300" alt="Syrinx listening pill">
 
 ## Features
 

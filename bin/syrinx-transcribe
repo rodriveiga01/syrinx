@@ -1,0 +1,41 @@
+#!/bin/sh
+# syrinx-transcribe — local speech-to-text for scripts and agents.
+# Uses the Cactus Whistle model (16.9 MB, on-device CPU, no network).
+# Usage: syrinx-transcribe <audio.wav> [--words]
+#   <audio.wav> : 16 kHz mono WAV works best; other rates need soxr.
+#   --words     : include per-word timestamps.
+# Output: JSON with text, language, ttft_ms, decode_tps (and words with --words).
+# Env: SYRINX_MODEL overrides the model path; NEEDLE_TELEMETRY=0 disables telemetry.
+set -eu
+if [ -z "${SYRINX_PYTHON:-}" ] && [ -f "$HOME/.config/syrinx/env" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.config/syrinx/env"
+fi
+if [ -z "${SYRINX_PYTHON:-}" ]; then
+  for c in "$HOME/Library/Application Support/pipx/venvs/cactus-needle/bin/python" \
+           "$HOME/.local/share/pipx/venvs/cactus-needle/bin/python"; do
+    if [ -x "$c" ]; then SYRINX_PYTHON="$c"; break; fi
+  done
+fi
+: "${SYRINX_PYTHON:=python3}"
+WEIGHTS="${SYRINX_MODEL:-${WHISTLE_WEIGHTS:-$HOME/.cache/syrinx/whistle.cact}}"
+NEEDLE_TELEMETRY="${NEEDLE_TELEMETRY:-0}"
+export NEEDLE_TELEMETRY
+if [ ! -f "$WEIGHTS" ]; then
+  echo "syrinx-transcribe: weights not found at $WEIGHTS" >&2
+  echo "syrinx-transcribe: install them by running install.sh from the Syrinx repo" >&2
+  exit 1
+fi
+exec "$SYRINX_PYTHON" - "$WEIGHTS" "$@" <<'PY'
+import json, sys
+weights = sys.argv[1]
+args = sys.argv[2:]
+words = "--words" in args
+audio = next((a for a in args if not a.startswith("--")), None)
+if not audio:
+    print(json.dumps({"error": "usage: syrinx-transcribe <audio.wav> [--words]"}))
+    sys.exit(2)
+import needle
+r = needle.transcribe(audio, weights=weights, word_timestamps=words)
+print(json.dumps(r))
+PY

@@ -1,0 +1,578 @@
+#!/bin/sh
+# polyglot: runs the Python below with the Syrinx engine interpreter.
+# Resolution order: $SYRINX_PYTHON, ~/.config/syrinx/env (written by
+# install.sh), well-known pipx venv locations, then python3.
+""":"
+if [ -z "${SYRINX_PYTHON:-}" ] && [ -f "$HOME/.config/syrinx/env" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.config/syrinx/env"
+fi
+if [ -z "${SYRINX_PYTHON:-}" ]; then
+  for c in "$HOME/Library/Application Support/pipx/venvs/cactus-needle/bin/python" \
+           "$HOME/.local/share/pipx/venvs/cactus-needle/bin/python"; do
+    if [ -x "$c" ]; then SYRINX_PYTHON="$c"; break; fi
+  done
+fi
+: "${SYRINX_PYTHON:=python3}"
+if [ ! -x "$SYRINX_PYTHON" ]; then
+  echo "syrinx: no Python engine found (checked SYRINX_PYTHON, pipx venvs, python3)" >&2
+  echo "syrinx: run install.sh from the Syrinx repo to set it up" >&2
+  exit 1
+fi
+exec "$SYRINX_PYTHON" "$0" "$@"
+"""
+"""syrinx: hold-to-talk dictation for macOS, powered by Cactus Whistle.
+
+Hold RIGHT OPTION, speak, release -> your words are typed wherever the
+cursor is. A small pill with live level bars appears top-center while you
+talk. Fully on-device (16.9 MB model, no network).
+
+Usage:
+    syrinx [--key right-option|right-cmd|right-ctrl]
+
+Notes:
+  - If you press any other key while holding the talk key, the take is
+    cancelled (so normal Option+key shortcuts keep working).
+  - Takes shorter than ~0.4 s or pure silence are ignored.
+  - Max 30 s per take (model limit) -> auto-stops.
+  - macOS will ask for Microphone + Accessibility permission on first run.
+    Grant both or it cannot hear you / cannot see the hotkey.
+Env:
+  SYRINX_MODEL        model path (default ~/.cache/syrinx/whistle.cact)
+  SYRINX_NO_PASTE=1   transcribe + set clipboard but skip Cmd+V (testing)
+  SYRINX_SOUND=1      re-enable the start/stop blip sounds (off by default)
+"""
+import collections
+import math
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import wave
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+MIN_SECONDS = 0.4
+MAX_SECONDS = 30.0
+def _env(*names):
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return ""
+
+
+WEIGHTS = os.path.expanduser(
+    _env("SYRINX_MODEL", "WHISTLE_WEIGHTS") or "~/.cache/syrinx/whistle.cact"
+)
+NO_PASTE = _env("SYRINX_NO_PASTE", "WHISTLE_DICTATE_NO_PASTE") == "1"
+SOUND = _env("SYRINX_SOUND", "WHISTLE_DICTATE_SOUND") == "1"
+DEBUG = _env("SYRINX_DEBUG", "WHISTLE_DICTATE_DEBUG") != ""
+
+KEYS = {
+    "right-option": "alt_r",
+    "right-cmd": "cmd_r",
+    "right-ctrl": "ctrl_r",
+}
+
+talk_key_name = "right-option"
+paste_file = None
+demo_pill = False
+for i, a in enumerate(sys.argv):
+    if a in ("-h", "--help"):
+        print(
+            "syrinx: HOLD right-option + speak + release to type "
+            "wherever your cursor is.\n"
+            "Options: --key right-option|right-cmd|right-ctrl"
+        )
+        sys.exit(0)
+    if a == "--paste-file" and i + 1 < len(sys.argv):
+        paste_file = sys.argv[i + 1]
+    if a == "--demo-pill":
+        demo_pill = True
+    if a == "--key" and i + 1 < len(sys.argv):
+        talk_key_name = sys.argv[i + 1]
+if talk_key_name not in KEYS:
+    print(f"unknown --key {talk_key_name!r}, choices: {sorted(KEYS)}")
+    sys.exit(2)
+
+import numpy as np  # noqa: E402
+from pynput import keyboard  # noqa: E402
+
+TALK_KEY = getattr(keyboard.Key, KEYS[talk_key_name])
+
+state = threading.Lock()
+held = False
+recording = False
+cancelled = False
+frames: list = []
+levels = collections.deque(maxlen=30)  # recent mic RMS 0..1 for the pill
+stream = None
+stop_timer = None
+
+# Pill state is plain data; the AppKit timer (main thread) renders it.
+# This keeps ALL AppKit calls on the main thread.
+pill = {"visible": False, "mode": "live", "hide_at": 0.0}
+
+
+def blip(name):
+    if not SOUND:
+        return
+    try:
+        p = f"/System/Library/Sounds/{name}.aiff"
+        if os.path.exists(p):
+            subprocess.Popen(
+                ["afplay", p],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
+def pill_show(mode):
+    with state:
+        pill["visible"] = True
+        pill["mode"] = mode
+        pill["hide_at"] = 0.0
+
+
+def pill_hide():
+    with state:
+        pill["visible"] = False
+
+
+# Preloaded speech model shared by all takes (created once in warmup()).
+_whistle = None
+
+
+def get_whistle():
+    global _whistle
+    if _whistle is None:
+        import needle
+
+        _whistle = needle.Whistle(weights=WEIGHTS)
+    return _whistle
+
+
+def warmup():
+    try:
+        import Quartz  # noqa: F401  (keystroke path, import cost paid once)
+        import sounddevice  # noqa: F401  (mic path, import cost paid once)
+
+        get_whistle()
+        print("warmed up: model + mic + keystroke ready", flush=True)
+    except Exception as e:
+        print(f"warmup failed (first take will be slower): {e}", flush=True)
+
+
+def audio_callback(indata, frame_count, time_info, status):
+    with state:
+        if recording:
+            frames.append(indata.copy())
+            try:
+                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                levels.append(min(1.0, rms * 4.0))
+            except Exception:
+                pass
+
+
+def start_recording():
+    global stream, stop_timer
+    import sounddevice as sd
+
+    with state:
+        if recording:
+            return
+        frames.clear()
+        levels.clear()
+        globals()["recording"] = True
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS, callback=audio_callback
+    )
+    stream.start()
+    stop_timer = threading.Timer(MAX_SECONDS, auto_stop)
+    stop_timer.daemon = True
+    stop_timer.start()
+    blip("Pop")
+    pill_show("live")
+    print("...listening (release to transcribe)", flush=True)
+
+
+def finish_recording(discard):
+    global stream, stop_timer
+    t0 = time.time()  # release moment: everything after this is overhead
+    with state:
+        was_recording = recording
+        globals()["recording"] = False
+        data = list(frames)
+    try:
+        if stop_timer:
+            stop_timer.cancel()
+    except Exception:
+        pass
+    try:
+        if stream:
+            stream.stop()
+            stream.close()
+    except Exception:
+        pass
+    stream = None
+    if not was_recording:
+        return
+    duration = sum(len(c) for c in data) / SAMPLE_RATE
+    blip("Purr")
+    if discard:
+        print(f"cancelled ({duration:.1f}s, another key was pressed)", flush=True)
+        pill_hide()
+        return
+    if duration < MIN_SECONDS:
+        print(f"ignored tap ({duration:.1f}s)", flush=True)
+        pill_hide()
+        return
+    print(f"transcribing {duration:.1f}s...", flush=True)
+    pill_hide()  # no post-listening animation: pill is gone the instant you release
+    transcribe_and_paste(data, t0)
+
+
+def auto_stop():
+    with state:
+        if not recording:
+            return
+    print("30s limit reached, stopping", flush=True)
+    finish_recording(discard=False)
+
+
+def transcribe_and_paste(data, t0):
+    audio = np.concatenate(data, axis=0).flatten()
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak < 0.01:
+        print("silence, nothing to type", flush=True)
+        pill_hide()
+        return
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        path = f.name
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(CHANNELS)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm.tobytes())
+        t1 = time.time()
+        r = get_whistle().transcribe(path)
+        t2 = time.time()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    text = (r.get("text") or "").strip()
+    if not text:
+        print("empty transcript, nothing to type", flush=True)
+        pill_hide()
+        return
+    print(f"heard [{r.get('language', '?')}]: {text}", flush=True)
+    paste(text)
+    print(
+        f"take done in {time.time() - t0:.2f}s "
+        f"(transcribe {t2 - t1:.2f}s)",
+        flush=True,
+    )
+
+
+def paste(text):
+    from Cocoa import NSPasteboard, NSPasteboardTypeString
+
+    pb = NSPasteboard.generalPasteboard()
+    old = pb.stringForType_(NSPasteboardTypeString)
+    pb.clearContents()
+    pb.setString_forType_(text, NSPasteboardTypeString)
+    time.sleep(0.02)
+    if NO_PASTE:
+        print("(NO_PASTE: clipboard set, skipping Cmd+V)", flush=True)
+        pill_hide()
+        return
+    post_cmd_v()  # in-process keystroke: instant, no osascript spawn
+    print("typed.", flush=True)
+    pill_hide()
+    # restore the user's old clipboard in the background (non-blocking),
+    # but only if they haven't copied something new meanwhile
+    def restore():
+        time.sleep(0.4)
+        try:
+            if pb.stringForType_(NSPasteboardTypeString) == text:
+                pb.clearContents()
+                if old is not None:
+                    pb.setString_forType_(old, NSPasteboardTypeString)
+        except Exception:
+            pass
+
+    threading.Thread(target=restore, daemon=True).start()
+
+
+def post_cmd_v():
+    import Quartz
+
+    down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)  # 9 = 'v'
+    Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+    up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
+    Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+
+def on_press(key):
+    global held, cancelled
+    if key == TALK_KEY:
+        with state:
+            if held:
+                return
+            held = True
+            cancelled = False
+        # tiny delay: a quick tap (<0.15s) is never dictation
+        threading.Timer(0.15, lambda: held and start_recording()).start()
+        return
+    # any other key while talk key is down -> normal shortcut, cancel take
+    with state:
+        if held and not cancelled:
+            cancelled = True
+
+
+def on_release(key):
+    global held
+    if key == TALK_KEY:
+        with state:
+            was_held = held
+            do_cancel = cancelled
+            held = False
+        if was_held:
+            finish_recording(discard=do_cancel)
+
+
+# --------------------------------------------------------------------------
+# Floating pill overlay (Wispr Flow style). All AppKit calls run on the main
+# thread via the timer; background threads only touch `pill`/levels above.
+# --------------------------------------------------------------------------
+PILL_W, PILL_H = 150, 44
+N_BARS, BAR_W, BAR_GAP = 7, 5, 5
+
+
+def run_overlay(test_seconds=0.0):
+    import objc  # noqa: E402
+    from Cocoa import (
+        NSApplication,
+        NSApplicationActivationPolicyAccessory,
+        NSBackingStoreBuffered,
+        NSBezierPath,
+        NSColor,
+        NSFloatingWindowLevel,
+        NSFont,
+        NSFontAttributeName,
+        NSForegroundColorAttributeName,
+        NSMakePoint,
+        NSMakeRect,
+        NSObject,
+        NSPanel,
+        NSScreen,
+        NSString,
+        NSTimer,
+        NSView,
+        NSWindowCollectionBehaviorCanJoinAllSpaces,
+        NSWindowCollectionBehaviorIgnoresCycle,
+        NSWindowCollectionBehaviorStationary,
+        NSWindowStyleMaskBorderless,
+        NSEvent,
+    )
+
+    class PillView(NSView):
+        def initWithFrame_(self, frame):
+            self = objc.super(PillView, self).initWithFrame_(frame)
+            self.disp = [0.0] * N_BARS  # smoothed bar heights, buttery motion
+            return self
+
+        def isOpaque(self):
+            return False
+
+        def drawRect_(self, rect):
+            with state:
+                recent = list(levels)
+            t = time.time()
+            # capsule body, no outline, no dot, no text: just bars
+            NSColor.blackColor().colorWithAlphaComponent_(0.78).set()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(0.5, 0.5, PILL_W - 1, PILL_H - 1), PILL_H / 2, PILL_H / 2
+            ).fill()
+            # smooth mirrored level bars, centered
+            vals = list(recent[-N_BARS:])
+            total = N_BARS * BAR_W + (N_BARS - 1) * BAR_GAP
+            x0 = (PILL_W - total) / 2
+            cy = PILL_H / 2
+            for i in range(N_BARS):
+                if vals:
+                    target = vals[i] if i < len(vals) else vals[-1]
+                else:
+                    target = 0.16 + 0.10 * math.sin(t * 4.0 + i * 0.8)
+                target = max(0.0, min(1.0, target))
+                self.disp[i] += (target - self.disp[i]) * 0.4
+                bar_h = 4 + self.disp[i] * 22
+                NSColor.whiteColor().colorWithAlphaComponent_(0.92).set()
+                NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    NSMakeRect(
+                        x0 + i * (BAR_W + BAR_GAP), cy - bar_h / 2, BAR_W, bar_h
+                    ),
+                    2.5,
+                    2.5,
+                ).fill()
+
+    class PillController(NSObject):
+        def init(self):
+            self = objc.super(PillController, self).init()
+            if self is None:
+                return None
+            self.window = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, PILL_W, PILL_H),
+                NSWindowStyleMaskBorderless,
+                NSBackingStoreBuffered,
+                False,
+            )
+            self.window.setOpaque_(False)
+            self.window.setBackgroundColor_(NSColor.clearColor())
+            self.window.setLevel_(NSFloatingWindowLevel)
+            self.window.setIgnoresMouseEvents_(True)
+            self.window.setHasShadow_(True)
+            self.window.setHidesOnDeactivate_(False)
+            self.window.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorIgnoresCycle
+            )
+            self.view = PillView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, PILL_W, PILL_H)
+            )
+            self.window.setContentView_(self.view)
+            self.shown = False
+            return self
+
+        def placeFixed(self):
+            # same place every time: top-center of the main screen
+            frame = NSScreen.mainScreen().visibleFrame()
+            x = frame.origin.x + (frame.size.width - PILL_W) / 2
+            y = frame.origin.y + frame.size.height - PILL_H - 12
+            self.window.setFrame_display_(NSMakeRect(x, y, PILL_W, PILL_H), True)
+
+        def tick_(self, timer):
+            try:
+                self.doTick_(timer)
+            except Exception:
+                if not getattr(self, "_err", False):
+                    self._err = True
+                    import traceback
+
+                    traceback.print_exc()
+            if DEBUG and not getattr(
+                self, "_dbg", False
+            ):
+                self._dbg = True
+                print("pill timer firing", flush=True)
+
+        def doTick_(self, timer):
+            with state:
+                vis = pill["visible"]
+                hide_at = pill["hide_at"]
+            if DEBUG:
+                n = getattr(self, "_n", 0) + 1
+                self._n = n
+                if n % 30 == 1:
+                    print(f"tick vis={vis} shown={self.shown}", flush=True)
+            if vis and not self.shown:
+                self.placeFixed()
+                self.window.orderFrontRegardless()
+                self.shown = True
+            elif not vis and self.shown:
+                self.window.orderOut_(None)
+                self.shown = False
+            if self.shown:
+                if hide_at and time.time() >= hide_at:
+                    pill_hide()
+                else:
+                    self.view.setNeedsDisplay_(True)
+
+    def NSMouseInRect(p, r, flipped):
+        return (
+            p.x >= r.origin.x
+            and p.x < r.origin.x + r.size.width
+            and p.y >= r.origin.y
+            and p.y < r.origin.y + r.size.height
+        )
+
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    controller = PillController.alloc().init()
+    if DEBUG:
+        print(f"controller={controller} window={controller.window}", flush=True)
+    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        1.0 / 30.0, controller, "tick:", None, True
+    )
+
+    def stop(signum, frame):
+        app.terminate_(None)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    # preload model + mic + keystroke in the background so the first
+    # real take never pays import/load costs while the user watches
+    threading.Thread(target=warmup, daemon=True).start()
+
+    if test_seconds > 0:
+        # demo mode for screenshot verification: fake live levels, then quit
+        def demo():
+            pill_show("live")
+            end = time.time() + test_seconds
+            i = 0
+            while time.time() < end:
+                with state:
+                    levels.append(0.45 + 0.4 * math.sin(i * 0.5))
+                i += 1
+                time.sleep(1.0 / 30.0)
+            pill_hide()
+            app.terminate_(None)
+
+        threading.Thread(target=demo, daemon=True).start()
+    else:
+        # hotkey listener lives on a background thread; AppKit owns main
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener.daemon = True
+        listener.start()
+
+    print(
+        f"syrinx ready: HOLD {talk_key_name} + speak + release to type. "
+        "Ctrl+C to quit.",
+        flush=True,
+    )
+    if not os.path.exists(WEIGHTS):
+        print(f"WARNING: weights not found at {WEIGHTS}", flush=True)
+    app.run()
+
+
+if paste_file:
+    # test hook: transcribe a file and run the paste path, then exit
+    with wave.open(paste_file, "rb") as w:
+        n = w.getnframes()
+        raw = w.readframes(n)
+        ch = w.getnchannels()
+    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if ch > 1:
+        pcm = pcm.reshape(-1, ch).mean(axis=1)
+    pill_hide()
+    transcribe_and_paste([pcm.reshape(-1, 1)], time.time())
+    sys.exit(0)
+
+if demo_pill:
+    run_overlay(test_seconds=4.0)
+else:
+    run_overlay()
